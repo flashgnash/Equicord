@@ -355,7 +355,9 @@ let captions: Caption[] = [];
 let uttCounter = 0;
 
 // Engine status mirrored from native (download/warm-up progress) for the overlay.
-let engineStatus: { phase: string; pct: number; message: string } = { phase: "idle", pct: 0, message: "" };
+// `paused`/`done`/`total` drive the download progress bar + pause button.
+let engineStatus: { phase: string; pct: number; message: string; paused: boolean; done: number; total: number } =
+    { phase: "idle", pct: 0, message: "", paused: false, done: 0, total: 0 };
 
 function upsertCaption(id: number, userId: string, res: Infer, final: boolean) {
     const now = Date.now();
@@ -831,6 +833,131 @@ const MODE_OPTIONS: Array<{ v: string; label: string; sub: string; warn?: boolea
 
 const engineBusy = () => ["provisioning", "downloading-model", "starting", "error"].includes(engineStatus.phase);
 
+// ── Download progress (bar in the pane if open, else a top-right tile) ─────────
+const isDownloading = () => engineStatus.phase === "provisioning" || engineStatus.phase === "downloading-model";
+
+function fmtBytes(n: number): string {
+    if (!n || n < 0) return "0 MB";
+    const mb = n / (1024 * 1024);
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+    return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+}
+
+function dlLabel(): string {
+    const s = engineStatus;
+    const base = s.message || (s.phase === "downloading-model" ? "Downloading model…" : "Downloading…");
+    if (s.paused) return `${base} paused`;
+    if (s.total > 0) return `${base} ${fmtBytes(s.done)} / ${fmtBytes(s.total)}`;
+    return base;
+}
+
+async function toggleDownloadPause() {
+    try {
+        const st = await Native.setDownloadPaused(!engineStatus.paused);
+        if (st) { engineStatus = st as typeof engineStatus; render(); }
+    } catch (e) { logger.error("pause toggle failed", e); }
+}
+
+// A themed progress row (label + track/fill + pause-resume button), reused by both
+// the pane bar and the floating tile. setState() repaints it from engineStatus.
+interface ProgWidget { root: HTMLDivElement; setState(): void; }
+function makeProgress(): ProgWidget {
+    const root = document.createElement("div");
+    Object.assign(root.style, { display: "flex", flexDirection: "column", gap: "6px" } as Partial<CSSStyleDeclaration>);
+
+    const label = document.createElement("div");
+    Object.assign(label.style, { fontSize: "11px", color: C.dim, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } as Partial<CSSStyleDeclaration>);
+
+    const barRow = document.createElement("div");
+    Object.assign(barRow.style, { display: "flex", alignItems: "center", gap: "8px" } as Partial<CSSStyleDeclaration>);
+
+    const track = document.createElement("div");
+    Object.assign(track.style, { flex: "1", height: "6px", borderRadius: "3px", background: "rgba(0,0,0,0.3)", overflow: "hidden" } as Partial<CSSStyleDeclaration>);
+    const fill = document.createElement("div");
+    Object.assign(fill.style, { height: "100%", width: "0%", borderRadius: "3px", background: C.accent, transition: "width 200ms ease" } as Partial<CSSStyleDeclaration>);
+    track.appendChild(fill);
+
+    const pause = document.createElement("div");
+    Object.assign(pause.style, { cursor: "pointer", fontSize: "12px", lineHeight: "1", color: C.dim, padding: "2px 4px", borderRadius: "4px", flex: "0 0 auto", userSelect: "none" } as Partial<CSSStyleDeclaration>);
+    pause.onmouseenter = () => { pause.style.color = C.text; };
+    pause.onmouseleave = () => { pause.style.color = engineStatus.paused ? C.accent : C.dim; };
+    pause.onclick = () => toggleDownloadPause();
+
+    barRow.append(track, pause);
+    root.append(label, barRow);
+
+    function setState() {
+        const s = engineStatus;
+        label.textContent = dlLabel();
+        label.style.color = s.phase === "error" ? C.crit : C.dim;
+        if (s.total > 0) {
+            fill.style.width = `${Math.max(0, Math.min(100, s.pct))}%`;
+            fill.style.opacity = s.paused ? "0.5" : "1";
+        } else {
+            fill.style.width = "100%";          // indeterminate — faint full bar
+            fill.style.opacity = "0.25";
+        }
+        pause.textContent = s.paused ? "▶" : "⏸";   // ▶ resume / ⏸ pause
+        pause.title = s.paused ? "Resume download" : "Pause download (free up bandwidth)";
+        pause.style.color = s.paused ? C.accent : C.dim;
+    }
+    setState();
+    return { root, setState };
+}
+
+// Floating top-right tile — shown while downloading only when the pane isn't open.
+let dlTileEl: HTMLDivElement | null = null;
+let dlTileWidget: ProgWidget | null = null;
+
+function mountDlTile() {
+    if (dlTileEl) return;
+    const el = document.createElement("div");
+    el.id = "closed-captions-dl-tile";
+    Object.assign(el.style, {
+        position: "fixed", top: "16px", right: "16px", zIndex: "6000",
+        width: "300px", maxWidth: "80vw", boxSizing: "border-box",
+        background: C.bg, border: `1px solid ${C.border}`, borderRadius: "8px",
+        boxShadow: C.shadow, fontFamily: C.font, color: C.text,
+        padding: "10px 12px", display: "flex", flexDirection: "column", gap: "8px",
+    } as Partial<CSSStyleDeclaration>);
+    const title = document.createElement("div");
+    title.textContent = "Captions engine";
+    Object.assign(title.style, { color: C.accent, fontWeight: "700", fontSize: "12px" } as Partial<CSSStyleDeclaration>);
+    const w = makeProgress();
+    dlTileWidget = w;
+    el.append(title, w.root);
+    document.body.appendChild(el);
+    dlTileEl = el;
+}
+
+function unmountDlTile() {
+    dlTileEl?.remove();
+    dlTileEl = null;
+    dlTileWidget = null;
+}
+
+let paneProgWidget: ProgWidget | null = null;
+
+// Route download progress to the pane bar when the pane is on screen, otherwise to
+// the floating tile — one or the other, never both.
+function renderDownloadUI() {
+    const downloading = isDownloading();
+    const paneShown = !!paneEl && paneEl.style.display !== "none";
+
+    if (paneProgWidget) {
+        const show = downloading && paneShown;
+        paneProgWidget.root.style.display = show ? "flex" : "none";
+        if (show) paneProgWidget.setState();
+    }
+
+    if (downloading && !paneShown) {
+        mountDlTile();
+        dlTileWidget?.setState();
+    } else {
+        unmountDlTile();
+    }
+}
+
 function mountPane() {
     if (paneEl) return;
 
@@ -939,10 +1066,16 @@ function mountPane() {
     }
     paneModeMenu = menu;
 
-    // Status row (engine download / warm-up / error), hidden unless busy.
+    // Status row (engine warm-up / error text), hidden unless busy. Active model/
+    // engine DOWNLOADS get the richer progress bar below instead of this text line.
     const status = document.createElement("div");
     Object.assign(status.style, { padding: "0 10px 6px", color: C.dim, fontSize: "11px", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", display: "none" } as Partial<CSSStyleDeclaration>);
     paneStatusEl = status;
+
+    // Download progress bar (shown only while downloading, via renderDownloadUI).
+    const prog = makeProgress();
+    Object.assign(prog.root.style, { padding: "0 12px 8px", display: "none" } as Partial<CSSStyleDeclaration>);
+    paneProgWidget = prog;
 
     const body = document.createElement("div");
     body.className = "cc-body";
@@ -962,7 +1095,7 @@ function mountPane() {
     } as Partial<CSSStyleDeclaration>);
     paneBacklogEl = backlog;
 
-    el.append(header, menu, status, body, backlog);
+    el.append(header, menu, status, prog.root, body, backlog);
     paneEl = el;
     paneBodyEl = body;
     // Placed into Discord's layout row (or fixed fallback) by dockPane() on render.
@@ -1000,6 +1133,7 @@ function unmountPane() {
     if (paneDocClick) { document.removeEventListener("click", paneDocClick, true); paneDocClick = null; }
     paneEl?.remove(); paneEl = null; paneBodyEl = null; paneStatusEl = null; paneBacklogEl = null;
     paneModeBtn = null; paneModeText = null; paneModeMenu = null; paneModeOpen = false; panePopBtn = null;
+    paneProgWidget = null;
     paneTabEl?.remove(); paneTabEl = null;
     paneStyleEl?.remove(); paneStyleEl = null;
 }
@@ -1085,10 +1219,16 @@ function renderPane() {
     updateInjectedStates();
     renderModeControl();
     if (panePopBtn) panePopBtn.style.color = popoutOpen ? C.accent : C.dim;
+    // Route the download bar/tile — must run even when the pane is hidden so the
+    // floating tile appears (first-run download before joining a call).
+    renderDownloadUI();
     if (!shown) return;
 
     const s = engineStatus;
-    paneStatusEl.textContent = engineBusy() ? (s.message || "…") + (s.pct ? ` ${s.pct}%` : "") : "";
+    // The text status covers warm-up ("starting…") + errors; active downloads use
+    // the richer progress bar (renderDownloadUI) so this line stays out of its way.
+    const textBusy = engineBusy() && !isDownloading();
+    paneStatusEl.textContent = textBusy ? (s.message || "…") + (s.pct ? ` ${s.pct}%` : "") : "";
     paneStatusEl.style.color = s.phase === "error" ? C.crit : C.dim;
 
     paneBodyEl.replaceChildren();
@@ -1330,7 +1470,7 @@ export default definePlugin({
             try {
                 const st = await Native.getStatus();
                 if (!st) return;
-                const changed = st.phase !== engineStatus.phase || st.pct !== engineStatus.pct || st.message !== engineStatus.message;
+                const changed = st.phase !== engineStatus.phase || st.pct !== engineStatus.pct || st.message !== engineStatus.message || st.paused !== engineStatus.paused;
                 engineStatus = st;
                 if (st.phase !== lastStatusPhase) {
                     lastStatusPhase = st.phase;
@@ -1397,6 +1537,7 @@ export default definePlugin({
         capCtx = null;
         captions = [];
         unmountOverlay();
+        unmountDlTile();
         unmountPane();
         delete (window as any).__closedCaptions;
         try { await Native.stop(); } catch (e) { logger.error("native stop failed", e); }

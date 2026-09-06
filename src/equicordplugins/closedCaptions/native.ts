@@ -135,13 +135,38 @@ function dataDir(): string {
 
 // ── Status (polled by the renderer for download/warm-up feedback) ─────────────
 type Phase = "idle" | "provisioning" | "downloading-model" | "starting" | "ready" | "error";
-let status: { phase: Phase; pct: number; message: string } = { phase: "idle", pct: 0, message: "" };
+// Pause state lives above the status helpers because setStatus reflects it.
+let downloadPaused = false;
+let currentDownloadAbort: AbortController | null = null;
+const isDownloadPhase = (p: Phase) => p === "provisioning" || p === "downloading-model";
+
+let status: { phase: Phase; pct: number; message: string; paused: boolean; done: number; total: number } =
+    { phase: "idle", pct: 0, message: "", paused: false, done: 0, total: 0 };
 function setStatus(phase: Phase, message = "", pct = 0) {
-    status = { phase, pct, message };
+    // Byte counters reset on any phase change; the resumable downloader fills them
+    // in via setProgress once the transfer starts. `paused` only means anything
+    // during a download phase.
+    status = { phase, pct, message, paused: isDownloadPhase(phase) && downloadPaused, done: 0, total: 0 };
     if (phase === "error") err("status:", message);
     else log("status:", phase, message || "", pct ? `${pct}%` : "");
 }
+// Live byte/percent progress from the downloader (preserves phase + message).
+function setProgress(done: number, total: number) {
+    status = { ...status, done, total, paused: downloadPaused, pct: total ? Math.floor((done / total) * 100) : status.pct };
+}
 export async function getStatus(_: IpcMainInvokeEvent) { return status; }
+
+// Pause/resume the in-flight provisioning download (engine binary or model) so the
+// user can free up bandwidth. Pausing aborts the current HTTP stream but KEEPS the
+// partial file; the downloader loop waits, then resumes with a Range header on
+// unpause (see downloadResumable). Frozen progress stays visible while paused.
+export async function setDownloadPaused(_: IpcMainInvokeEvent, paused: boolean) {
+    downloadPaused = !!paused;
+    status = { ...status, paused: downloadPaused };
+    if (downloadPaused && currentDownloadAbort) { try { currentDownloadAbort.abort(); } catch { /* ignore */ } }
+    log(downloadPaused ? "download paused by user" : "download resumed by user");
+    return status;
+}
 
 // GPU governor snapshot — includes the live effective tier for the sidebar label.
 export async function getGpu(_: IpcMainInvokeEvent) {
@@ -327,7 +352,7 @@ async function refreshPowerWinMac() {
         if (platform() === "win32") {
             // Win32_Battery.BatteryStatus: 1 = discharging (on battery); anything
             // else = running on AC. No battery (desktop) → empty → AC.
-            const { stdout } = await pexecFile("powershell", [
+            const { stdout } = await pexecFile(psExe(), [
                 "-NoProfile", "-NonInteractive", "-Command",
                 "(Get-CimInstance Win32_Battery | Select-Object -First 1 -ExpandProperty BatteryStatus)",
             ], { timeout: 8000 });
@@ -391,7 +416,7 @@ async function freePort(port: number): Promise<void> {
             }
         } else if (platform() === "win32") {
             let out = "";
-            try { out = (await pexecFile("netstat", ["-ano"])).stdout; } catch { return; }
+            try { out = (await pexecFile(sys32("netstat.exe"), ["-ano"])).stdout; } catch { return; }
             const pids = new Set<string>();
             for (const line of out.split("\n")) {
                 if (line.includes(":" + port) && /LISTENING/i.test(line)) {
@@ -400,7 +425,7 @@ async function freePort(port: number): Promise<void> {
                     if (/^\d+$/.test(pid) && pid !== "0") pids.add(pid);
                 }
             }
-            for (const pid of pids) { try { await pexecFile("taskkill", ["/F", "/PID", pid]); } catch { /* ignore */ } }
+            for (const pid of pids) { try { await pexecFile(sys32("taskkill.exe"), ["/F", "/PID", pid]); } catch { /* ignore */ } }
         } else {
             // macOS / other: lsof is present by default on darwin.
             let out = "";
@@ -424,25 +449,83 @@ function sha256File(p: string): Promise<string> {
     });
 }
 
-async function downloadTo(url: string, dest: string, onPct?: (pct: number) => void): Promise<void> {
-    const res = await fetch(url, { redirect: "follow" });
-    if (!res.ok || !res.body) throw new Error(`GET ${url} → ${res.status}`);
-    const total = Number(res.headers.get("content-length") || 0);
-    let done = 0;
-    const body = Readable.fromWeb(res.body as any);
-    if (onPct && total) {
-        body.on("data", (c: Buffer) => { done += c.length; onPct(Math.floor((done / total) * 100)); });
+// Resumable, pausable download. Continues an existing partial at `dest` via an
+// HTTP Range request (so a paused/interrupted big-model download picks up where it
+// left off instead of restarting), and can be paused mid-stream: setDownloadPaused
+// aborts the fetch, we keep the bytes already on disk, wait, then re-request the
+// remainder. Progress is reported as (bytesDone, bytesTotal). Safe against a torn
+// tail — we always re-Range from the actual on-disk size, and the SHA check at the
+// call site is the final guard.
+async function downloadResumable(url: string, dest: string, onProgress: (done: number, total: number) => void): Promise<void> {
+    let start = 0;
+    try { if (existsSync(dest)) start = statSync(dest).size; } catch { start = 0; }
+    let total = 0;
+    for (;;) {
+        while (downloadPaused) await sleep(400);   // hold here until the user resumes
+        const ac = new AbortController();
+        currentDownloadAbort = ac;
+        let res: Awaited<ReturnType<typeof fetch>>;
+        try {
+            res = await fetch(url, {
+                redirect: "follow",
+                signal: ac.signal,
+                headers: start > 0 ? { Range: `bytes=${start}-` } : {},
+            });
+        } catch (e) {
+            currentDownloadAbort = null;
+            if (downloadPaused) continue;          // aborted by a pause → loop & wait
+            throw e;
+        }
+        if (res.status === 416) { currentDownloadAbort = null; return; }   // range past EOF → already complete
+        if (!res.ok || !res.body) { currentDownloadAbort = null; throw new Error(`GET ${url} → ${res.status}`); }
+        const partial = res.status === 206;
+        if (start > 0 && !partial) {               // server ignored Range → restart clean
+            start = 0;
+            try { rmSync(dest, { force: true }); } catch { /* ignore */ }
+        }
+        const len = Number(res.headers.get("content-length") || 0);
+        total = partial ? start + len : len;
+        let done = start;
+        onProgress(done, total);
+        const body = Readable.fromWeb(res.body as any);
+        body.on("data", (c: Buffer) => { done += c.length; onProgress(done, total); });
+        try {
+            await pipeline(body, createWriteStream(dest, { flags: partial ? "a" : "w" }));
+            currentDownloadAbort = null;
+            return;                                 // finished
+        } catch (e) {
+            currentDownloadAbort = null;
+            if (downloadPaused) {                    // paused mid-stream → resume from on-disk size
+                try { start = existsSync(dest) ? statSync(dest).size : start; } catch { /* keep */ }
+                continue;
+            }
+            throw e;
+        }
     }
-    await pipeline(body, createWriteStream(dest));
 }
+
+// Absolute paths to Windows system tools. We do NOT trust the spawned Electron
+// process's PATH — on a locked-down box it can lack System32, so a bare
+// `powershell`/`tar`/`netstat` spawn fails with ENOENT (this is the most likely
+// cause of the "ENOENT" a tester hit right after the model download: the engine
+// unpack step shelled out to a bare `powershell`). Resolve from %SystemRoot%.
+function winRoot(): string { return process.env.SystemRoot || process.env.windir || "C:\\Windows"; }
+function sys32(exe: string): string { return join(winRoot(), "System32", exe); }
+function psExe(): string { return join(winRoot(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"); }
 
 async function extract(archive: string, kind: "zip" | "tgz", destDir: string): Promise<void> {
     mkdirSync(destDir, { recursive: true });
     if (kind === "zip") {
         if (platform() === "win32") {
-            // PowerShell's Expand-Archive ships with every supported Windows —
-            // no bundled unzip dependency needed.
-            await pexecFile("powershell", [
+            // Windows 10 (1803+) ships bsdtar as System32\tar.exe, which extracts
+            // .zip too — try it (absolute path) first; fall back to PowerShell's
+            // Expand-Archive (also absolute). Both resolved from %SystemRoot% so a
+            // missing PATH can't ENOENT us.
+            try {
+                await pexecFile(sys32("tar.exe"), ["-xf", archive, "-C", destDir]);
+                return;
+            } catch { /* fall through to PowerShell */ }
+            await pexecFile(psExe(), [
                 "-NoProfile", "-NonInteractive", "-Command",
                 `Expand-Archive -Force -LiteralPath '${archive}' -DestinationPath '${destDir}'`,
             ]);
@@ -458,14 +541,14 @@ async function extract(archive: string, kind: "zip" | "tgz", destDir: string): P
 // Does this Windows box have an NVIDIA GPU (→ fetch the CUDA build)?
 async function windowsHasNvidia(): Promise<boolean> {
     try {
-        const { stdout } = await pexecFile("powershell", [
+        const { stdout } = await pexecFile(psExe(), [
             "-NoProfile", "-NonInteractive", "-Command",
             "(Get-CimInstance Win32_VideoController).Name -join ';'",
         ], { timeout: 8000 });
         return /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(stdout);
     } catch {
         try {
-            const { stdout } = await pexecFile("wmic", ["path", "win32_VideoController", "get", "name"], { timeout: 8000 });
+            const { stdout } = await pexecFile(sys32("wbem\\wmic.exe"), ["path", "win32_VideoController", "get", "name"], { timeout: 8000 });
             return /nvidia|geforce|rtx|gtx/i.test(stdout);
         } catch { return false; }
     }
@@ -535,12 +618,17 @@ async function resolveBinary(): Promise<ResolvedBin | null> {
     const msg = `Downloading speech engine (${asset.label})…`;
     setStatus("provisioning", msg);
     const tmp = join(dataDir(), `bin-dl.${asset.kind === "zip" ? "zip" : "tar.gz"}`);
+    // The engine bundle is small; a stale partial from a PREVIOUS run could be for a
+    // different asset (vendor switch), and resuming that would corrupt it — start clean.
+    try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
     try {
-        await downloadTo(asset.url, tmp, pct => setStatus("provisioning", msg, pct));
+        await downloadResumable(asset.url, tmp, setProgress);
+        status.message = msg; status.phase = "provisioning";
         const got = await sha256File(tmp);
         if (got !== asset.sha256) throw new Error(`binary checksum mismatch (${got})`);
         rmSync(home, { recursive: true, force: true });
-        await extract(tmp, asset.kind, home);
+        try { await extract(tmp, asset.kind, home); }
+        catch (e) { throw new Error(`could not unpack speech engine (${(e as Error)?.message || e})`); }
         bin = findServerBinary(home);
         if (!bin) throw new Error("extracted bundle has no whisper-server");
         if (platform() !== "win32") chmodSync(bin, 0o755);
@@ -579,10 +667,12 @@ async function resolveModel(role: Role): Promise<string | null> {
     }
 
     const label = `${key} model`;
-    setStatus("downloading-model", `Downloading ${label}…`);
-    const tmp = dest + ".part";
+    const dlMsg = `Downloading ${label}…`;
+    setStatus("downloading-model", dlMsg);
+    const tmp = dest + ".part";   // stable name + URL → a paused/partial .part resumes here
     try {
-        await downloadTo(info.url, tmp, pct => setStatus("downloading-model", `Downloading ${label}…`, pct));
+        await downloadResumable(info.url, tmp, setProgress);
+        status.message = dlMsg; status.phase = "downloading-model";
         const got = await sha256File(tmp);
         if (got !== info.sha256) throw new Error(`model checksum mismatch (${got})`);
         rmSync(dest, { force: true });
@@ -629,6 +719,20 @@ async function ensureServerFor(role: Role): Promise<boolean> {
                 env,
             });
             s.proc = proc;
+            // A spawn failure (e.g. ENOENT — binary path wrong / PATH fallback with
+            // nothing installed) is emitted ASYNChronously on the child; with no
+            // listener Node re-throws it as an uncaught exception, which Electron
+            // shows as a "JavaScript error in the main process" dialog. Handle it so
+            // it becomes a clean, surfaced status the renderer can show instead.
+            proc.on("error", e => {
+                const code = (e as NodeJS.ErrnoException)?.code;
+                err(`whisper-server ${role} failed to spawn`, e);
+                setStatus("error", code === "ENOENT"
+                    ? `Speech engine binary not found (${rb.bin})`
+                    : `Speech engine failed to start: ${(e as Error)?.message || e}`);
+                s.proc = null;
+                s.readyPromise = null;
+            });
             // Run at the LOWEST OS priority so the compositor, Electron and games
             // always win CPU scheduling — whisper should only use what's left over.
             try { if (proc.pid) setPriority(proc.pid, 19); } catch { /* not permitted / unsupported */ }
@@ -866,13 +970,14 @@ function writePopoutHtml(theme: any) {
   body{font-family:${theme?.font || "sans-serif"};background:${theme?.bg || "#2b2d31"};color:${theme?.text || "#dbdee1"}}
   #bar{height:28px;display:flex;align-items:center;gap:6px;padding:0 8px;background:${theme?.headerBg || "#1e1f22"};border-bottom:1px solid ${theme?.border || "#111"};-webkit-app-region:drag;user-select:none}
   #title{flex:1;font-weight:700;font-size:12px;color:${theme?.accent || "#5865f2"}}
-  .btn{-webkit-app-region:no-drag;cursor:pointer;color:${theme?.dim || "#949ba4"};font-size:12px;font-weight:700;padding:2px 5px;border-radius:4px}
+  .btn{-webkit-app-region:no-drag;cursor:pointer;color:${theme?.dim || "#949ba4"};font-size:12px;font-weight:700;padding:2px 5px;border-radius:4px;display:flex;align-items:center}
   .btn:hover{color:${theme?.text || "#fff"};background:rgba(127,127,127,.15)}
+  .btn svg{display:block;width:15px;height:15px;fill:currentColor}
   #body{padding:8px 10px;height:calc(100% - 28px);overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin}
   .row{font-size:14px;line-height:1.4;word-break:break-word}
   .nm{font-weight:700}
 </style></head><body>
-<div id="bar"><span id="title">Captions</span><span class="btn" id="pin" title="Pin on top">PIN</span><span class="btn" id="close" title="Close">\u2715</span></div>
+<div id="bar"><span id="title">Captions</span><span class="btn" id="pin" title="Pin on top"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.38 11.38a3 3 0 0 0 4.24 0l.03-.03a.5.5 0 0 0 0-.7L13.35.35a.5.5 0 0 0-.7 0l-.03.03a3 3 0 0 0 0 4.24L9 8.29a5 5 0 0 0-5.36 1.1l-.85.86a.5.5 0 0 0 0 .7l4.24 4.25L2.3 20.3a1 1 0 1 0 1.42 1.42l4.09-4.09 4.25 4.24a.5.5 0 0 0 .7 0l.86-.85a5 5 0 0 0 1.1-5.36l3.66-3.62Z"></path></svg></span><span class="btn" id="close" title="Close">\u2715</span></div>
 <div id="body"></div>
 <script>
 const { ipcRenderer } = require('electron');

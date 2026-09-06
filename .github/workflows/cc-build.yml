@@ -2,9 +2,16 @@ name: CC Build
 
 # Self-contained build for the ClosedCaptions test fork: builds the Equicord
 # desktop bundle (equibop.asar, which includes the plugin) and publishes it to
-# THIS fork's own releases so Equibop can download it. Manual trigger only.
+# THIS fork's own releases so Equibop can download it. Triggered manually OR by a
+# push that touches the plugin / this workflow (uses the built-in Actions token to
+# publish, so it needs no local auth).
 on:
     workflow_dispatch:
+    push:
+        branches: [main]
+        paths:
+            - "src/equicordplugins/closedCaptions/**"
+            - ".github/workflows/cc-build.yml"
 
 permissions:
     contents: write
