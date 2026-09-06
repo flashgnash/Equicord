@@ -1,0 +1,40 @@
+name: CC Build
+
+# Self-contained build for the ClosedCaptions test fork: builds the Equicord
+# desktop bundle (equibop.asar, which includes the plugin) and publishes it to
+# THIS fork's own releases so Equibop can download it. Manual trigger only.
+on:
+    workflow_dispatch:
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: pnpm/action-setup@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build standalone (produces dist/equibop.asar)
+              run: pnpm buildStandalone
+
+            - name: Publish equibop.asar to this fork's latest release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  test -f dist/equibop.asar
+                  gh release delete cc-latest -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+                  gh release create cc-latest dist/equibop.asar \
+                    -R "$GITHUB_REPOSITORY" --latest \
+                    --title "ClosedCaptions build" \
+                    --notes "Automated ClosedCaptions test build."
