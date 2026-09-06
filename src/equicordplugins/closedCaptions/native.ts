@@ -49,7 +49,7 @@ import { ChildProcess, execFile, spawn } from "child_process";
 import { createHash } from "crypto";
 import { app, BrowserWindow, ipcMain } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { appendFileSync, chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { arch, platform, setPriority } from "os";
 import { dirname, join } from "path";
 import { Readable } from "stream";
@@ -58,8 +58,8 @@ import { promisify } from "util";
 
 const pexecFile = promisify(execFile);
 
-function log(...a: any[]) { console.log("[ClosedCaptions]", ...a); }
-function err(...a: any[]) { console.error("[ClosedCaptions]", ...a); }
+function log(...a: any[]) { console.log("[ClosedCaptions]", ...a); fileLog("LOG", a); }
+function err(...a: any[]) { console.error("[ClosedCaptions]", ...a); fileLog("ERR", a); }
 
 // ── Pinned provisioning sources ──────────────────────────────────────────────
 // Pinned to a specific whisper.cpp release tag so the assets (and their hashes)
@@ -132,6 +132,34 @@ function dataDir(): string {
     mkdirSync(d, { recursive: true });
     return d;
 }
+
+// ── Persistent log file ───────────────────────────────────────────────────────
+// A tester who hits an error only sees a transient toast — write everything to a
+// file they can grab and send us. Every log()/err() is mirrored here. Location:
+//   Windows  %APPDATA%\<App>\ClosedCaptions\closed-captions.log
+//   Linux    ~/.config/<App>/ClosedCaptions/closed-captions.log
+//   macOS    ~/Library/Application Support/<App>/ClosedCaptions/closed-captions.log
+let logHeaderWritten = false;
+function logFilePath(): string { return join(dataDir(), "closed-captions.log"); }
+function fileLog(level: string, parts: any[]) {
+    try {
+        const p = logFilePath();
+        if (!logHeaderWritten) {
+            logHeaderWritten = true;
+            // Cap growth across sessions — start fresh if the last file got large.
+            try { if (existsSync(p) && statSync(p).size > 1_000_000) rmSync(p, { force: true }); } catch { /* ignore */ }
+            appendFileSync(p, `\n===== ClosedCaptions session ${new Date().toISOString()} — ${platform()}-${arch()}, electron ${process.versions.electron || "?"}, node ${process.versions.node || "?"} =====\n`);
+        }
+        const line = parts.map(x => {
+            if (x instanceof Error) return `${x.message}${x.stack ? "\n" + x.stack : ""}`;
+            if (x && typeof x === "object") { try { return JSON.stringify(x); } catch { return String(x); } }
+            return String(x);
+        }).join(" ");
+        appendFileSync(p, `[${new Date().toISOString()}] ${level} ${line}\n`);
+    } catch { /* never let logging break anything */ }
+}
+// Renderer asks for this so it can show the tester exactly where the log lives.
+export async function getLogPath(_: IpcMainInvokeEvent) { return logFilePath(); }
 
 // ── Status (polled by the renderer for download/warm-up feedback) ─────────────
 type Phase = "idle" | "provisioning" | "downloading-model" | "starting" | "ready" | "error";
@@ -760,6 +788,7 @@ async function ensureServerFor(role: Role): Promise<boolean> {
             setStatus("error", "Speech engine did not start in time");
             return false;
         } catch (e) {
+            err(`ensureServerFor(${role}) failed`, e);   // full stack → log file
             setStatus("error", String((e as Error)?.message || e));
             s.proc = null;
             return false;

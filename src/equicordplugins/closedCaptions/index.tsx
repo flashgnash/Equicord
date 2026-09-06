@@ -35,7 +35,7 @@ import { Toasts } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.ClosedCaptions as PluginNative<typeof import("./native")>;
 const logger = new Logger("ClosedCaptions");
-const VERSION = "cc-2";
+const VERSION = "cc-3";
 
 const UserStore = findStoreLazy("UserStore");
 // For capturing your OWN voice: SpeakingStore mirrors Discord's real transmit
@@ -358,6 +358,9 @@ let uttCounter = 0;
 // `paused`/`done`/`total` drive the download progress bar + pause button.
 let engineStatus: { phase: string; pct: number; message: string; paused: boolean; done: number; total: number } =
     { phase: "idle", pct: 0, message: "", paused: false, done: 0, total: 0 };
+// Absolute path of the native log file, fetched once at start — shown to the user
+// on error so they can grab it (a transient toast is easy to miss).
+let logPath = "";
 
 function upsertCaption(id: number, userId: string, res: Infer, final: boolean) {
     const now = Date.now();
@@ -1228,7 +1231,10 @@ function renderPane() {
     // The text status covers warm-up ("starting…") + errors; active downloads use
     // the richer progress bar (renderDownloadUI) so this line stays out of its way.
     const textBusy = engineBusy() && !isDownloading();
-    paneStatusEl.textContent = textBusy ? (s.message || "…") + (s.pct ? ` ${s.pct}%` : "") : "";
+    paneStatusEl.textContent = textBusy
+        ? (s.message || "…") + (s.pct ? ` ${s.pct}%` : "") + (s.phase === "error" && logPath ? ` · log: ${logPath}` : "")
+        : "";
+    paneStatusEl.title = s.phase === "error" && logPath ? `Details written to ${logPath}` : "";
     paneStatusEl.style.color = s.phase === "error" ? C.crit : C.dim;
 
     paneBodyEl.replaceChildren();
@@ -1455,6 +1461,7 @@ export default definePlugin({
 
     async start() {
         logger.info(`ClosedCaptions ${VERSION} started`);
+        try { logPath = await Native.getLogPath(); logger.info("log file:", logPath); } catch { /* ignore */ }
         C = resolvePalette();   // theme stylesheet is present by now
         mountOverlay();
         mountPane();
@@ -1476,7 +1483,10 @@ export default definePlugin({
                     lastStatusPhase = st.phase;
                     // Only surface hard errors as a toast; download/warm-up
                     // progress lives quietly in the pane header instead.
-                    if (st.phase === "error") toast("Captions: " + (st.message || "engine error"), Toasts.Type.FAILURE);
+                    if (st.phase === "error") {
+                        toast("Captions: " + (st.message || "engine error") + (logPath ? ` (log: ${logPath})` : ""), Toasts.Type.FAILURE);
+                        if (logPath) logger.error("Captions engine error — full details in", logPath);
+                    }
                 }
                 if (changed) render();
             } catch { /* ignore */ }
