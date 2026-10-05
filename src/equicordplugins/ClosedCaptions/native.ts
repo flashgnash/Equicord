@@ -515,7 +515,7 @@ async function resolveModel(role: Role): Promise<string | null> {
     if (existsSync(dest) && statSync(dest).size === info.size) return dest;
 
     if (!cfg.autoDownload) {
-        setStatus("error", "Model not downloaded and auto-download is off");
+        setStatus("error", "Model not downloaded and auto-download is OFF — enable \"Auto-download\" in the ClosedCaptions plugin settings");
         return null;
     }
 
@@ -546,7 +546,17 @@ async function ensureServerFor(role: Role): Promise<boolean> {
     s.readyPromise = (async () => {
         try {
             const model = await resolveModel(role);
-            if (!model || !existsSync(model)) { setStatus("error", "No model available"); return false; }
+            if (!model || !existsSync(model)) {
+                // resolveModel sets a SPECIFIC error (e.g. "auto-download is
+                // off") — don't clobber it with the generic one: a tester's
+                // screenshot of this message is often all we get to debug with.
+                if (status.phase !== "error") {
+                    setStatus("error", model
+                        ? `Model file missing (${model}) — check disk space/antivirus, then restart Discord`
+                        : "No model available");
+                }
+                return false;
+            }
             const rb = await resolveBinary();
             if (!rb) { setStatus("error", "No speech engine available"); return false; }
 

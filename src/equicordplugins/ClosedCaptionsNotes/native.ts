@@ -908,7 +908,12 @@ async function ensureLlm(): Promise<boolean> {
     llm.readyPromise = (async () => {
         try {
             const model = await resolveLlmModel();
-            if (!model || !existsSync(model)) { setNotesStatus("error", "No notes model available"); return false; }
+            if (!model || !existsSync(model)) {
+                // Keep resolveLlmModel's specific error (e.g. auto-download off)
+                // rather than clobbering it with the generic one.
+                if (notesStatus.phase !== "error") setNotesStatus("error", "No notes model available");
+                return false;
+            }
             const rb = await resolveLlmBinary();
             if (!rb) { setNotesStatus("error", "No notes engine available"); return false; }
 
