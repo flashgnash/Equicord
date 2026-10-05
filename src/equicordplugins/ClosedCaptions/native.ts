@@ -46,20 +46,26 @@
  */
 
 import { ChildProcess, execFile, spawn } from "child_process";
-import { createHash } from "crypto";
-import { app, BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, ipcMain } from "electron";
 import type { IpcMainInvokeEvent } from "electron";
-import { appendFileSync, chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { arch, platform, setPriority } from "os";
 import { dirname, join } from "path";
-import { Readable } from "stream";
-import { pipeline } from "stream/promises";
 import { promisify } from "util";
 
-const pexecFile = promisify(execFile);
+// Shared infrastructure (one module instance across every plugin native):
+// logging, the resumable downloader + its pause switch, extract/port helpers,
+// and the engine-extension registry the notes plugin hooks into. Lives in a
+// separate file because Vencord auto-registers every export of THIS file as
+// an ipcMain.handle() channel — exports here must stay IPC-shaped.
+import type { BinAsset, Phase, ResolvedBin, Srv } from "./nativeShared";
+import {
+    dataDir, downloadResumable, err, extract, fireEngineExtensions, freePort,
+    isDownloadPaused, log, logFilePath, PORT, psExe, setDownloadPausedState,
+    sha256File, sleep, sys32,
+} from "./nativeShared";
 
-function log(...a: any[]) { console.log("[ClosedCaptions]", ...a); fileLog("LOG", a); }
-function err(...a: any[]) { console.error("[ClosedCaptions]", ...a); fileLog("ERR", a); }
+const pexecFile = promisify(execFile);
 
 // ── Pinned provisioning sources ──────────────────────────────────────────────
 // Pinned to a specific whisper.cpp release tag so the assets (and their hashes)
@@ -68,7 +74,6 @@ function err(...a: any[]) { console.error("[ClosedCaptions]", ...a); fileLog("ER
 const REL = "b4938";
 const REL_BASE = `https://github.com/ggml-org/whisper.cpp/releases/download/${REL}`;
 
-interface BinAsset { url: string; sha256: string; kind: "zip" | "tgz"; label: string; }
 // Windows x64 comes in flavours; we pick by detected GPU vendor (see selectBinAsset).
 // NVIDIA → CUDA (real GPU accel, self-contained, big); AMD/Intel → BLAS CPU
 // (upstream ships NO Windows Vulkan build, so integrated/AMD GPUs run on CPU there —
@@ -124,48 +129,12 @@ const MODELS: Record<string, ModelInfo> = {
     },
 };
 
-const PORT = parseInt(process.env.CC_WHISPER_PORT || "58273", 10);
 const HOST = "127.0.0.1";
 
-function dataDir(): string {
-    const d = join(app.getPath("userData"), "ClosedCaptions");
-    mkdirSync(d, { recursive: true });
-    return d;
-}
-
-// ── Persistent log file ───────────────────────────────────────────────────────
-// A tester who hits an error only sees a transient toast — write everything to a
-// file they can grab and send us. Every log()/err() is mirrored here. Location:
-//   Windows  %APPDATA%\<App>\ClosedCaptions\closed-captions.log
-//   Linux    ~/.config/<App>/ClosedCaptions/closed-captions.log
-//   macOS    ~/Library/Application Support/<App>/ClosedCaptions/closed-captions.log
-let logHeaderWritten = false;
-function logFilePath(): string { return join(dataDir(), "closed-captions.log"); }
-function fileLog(level: string, parts: any[]) {
-    try {
-        const p = logFilePath();
-        if (!logHeaderWritten) {
-            logHeaderWritten = true;
-            // Cap growth across sessions — start fresh if the last file got large.
-            try { if (existsSync(p) && statSync(p).size > 1_000_000) rmSync(p, { force: true }); } catch { /* ignore */ }
-            appendFileSync(p, `\n===== ClosedCaptions session ${new Date().toISOString()} — ${platform()}-${arch()}, electron ${process.versions.electron || "?"}, node ${process.versions.node || "?"} =====\n`);
-        }
-        const line = parts.map(x => {
-            if (x instanceof Error) return `${x.message}${x.stack ? "\n" + x.stack : ""}`;
-            if (x && typeof x === "object") { try { return JSON.stringify(x); } catch { return String(x); } }
-            return String(x);
-        }).join(" ");
-        appendFileSync(p, `[${new Date().toISOString()}] ${level} ${line}\n`);
-    } catch { /* never let logging break anything */ }
-}
 // Renderer asks for this so it can show the tester exactly where the log lives.
 export async function getLogPath(_: IpcMainInvokeEvent) { return logFilePath(); }
 
 // ── Status (polled by the renderer for download/warm-up feedback) ─────────────
-type Phase = "idle" | "provisioning" | "downloading-model" | "starting" | "ready" | "error";
-// Pause state lives above the status helpers because setStatus reflects it.
-let downloadPaused = false;
-let currentDownloadAbort: AbortController | null = null;
 const isDownloadPhase = (p: Phase) => p === "provisioning" || p === "downloading-model";
 
 let status: { phase: Phase; pct: number; message: string; paused: boolean; done: number; total: number } =
@@ -174,13 +143,13 @@ function setStatus(phase: Phase, message = "", pct = 0) {
     // Byte counters reset on any phase change; the resumable downloader fills them
     // in via setProgress once the transfer starts. `paused` only means anything
     // during a download phase.
-    status = { phase, pct, message, paused: isDownloadPhase(phase) && downloadPaused, done: 0, total: 0 };
+    status = { phase, pct, message, paused: isDownloadPhase(phase) && isDownloadPaused(), done: 0, total: 0 };
     if (phase === "error") err("status:", message);
     else log("status:", phase, message || "", pct ? `${pct}%` : "");
 }
 // Live byte/percent progress from the downloader (preserves phase + message).
 function setProgress(done: number, total: number) {
-    status = { ...status, done, total, paused: downloadPaused, pct: total ? Math.floor((done / total) * 100) : status.pct };
+    status = { ...status, done, total, paused: isDownloadPaused(), pct: total ? Math.floor((done / total) * 100) : status.pct };
 }
 export async function getStatus(_: IpcMainInvokeEvent) { return status; }
 
@@ -189,10 +158,8 @@ export async function getStatus(_: IpcMainInvokeEvent) { return status; }
 // partial file; the downloader loop waits, then resumes with a Range header on
 // unpause (see downloadResumable). Frozen progress stays visible while paused.
 export async function setDownloadPaused(_: IpcMainInvokeEvent, paused: boolean) {
-    downloadPaused = !!paused;
-    status = { ...status, paused: downloadPaused };
-    if (downloadPaused && currentDownloadAbort) { try { currentDownloadAbort.abort(); } catch { /* ignore */ } }
-    log(downloadPaused ? "download paused by user" : "download resumed by user");
+    setDownloadPausedState(paused);
+    status = { ...status, paused: isDownloadPaused() };
     return status;
 }
 
@@ -225,13 +192,15 @@ interface Cfg {
 }
 let cfg: Cfg = { quality: "balanced", language: "auto", threads: 4, autoDownload: true, audioCtx: 0, gpuDuty: 0.5, mode: "auto", confidence: 0.55, beamSize: 2 };
 
+// Read-only view of the caption config for extensions (threads, autoDownload).
+export function captionConfig(): Readonly<Cfg> { return cfg; }
+
 // Tiered engine: a "fast" server (small model, kept warm — instant tier + the
 // throttled corrective pass via per-request beam) and a "best" server (the big
 // model — only run when there's spare GPU). Beam size is per-request, so one
 // server per MODEL suffices. A single global lock still serializes ALL decodes
 // across both servers (one shared GPU).
 type Role = "fast" | "best";
-interface Srv { proc: ChildProcess | null; readyPromise: Promise<boolean> | null; port: number; }
 const servers: Record<Role, Srv> = {
     fast: { proc: null, readyPromise: null, port: PORT },
     best: { proc: null, readyPromise: null, port: PORT + 1 },
@@ -246,6 +215,9 @@ const BEST_IDLE_MS = 90_000;     // free the big model's RAM after this long unu
 // dropped rather than queued, so live captions never pile up a backlog behind a
 // slow decode (`transcribePartial` below).
 let locked = false;
+// Is a caption decode holding the engine right now? Extensions (the notes
+// LLM scheduler) defer their GPU work while this is true.
+export function isDecodeBusy(): boolean { return locked; }
 // Priority queue: higher `prio` is served first (remote speakers = 1, your OWN
 // speech = 0 so it always yields the GPU to others), FIFO within a priority.
 const waiters: Array<{ res: () => void; prio: number }> = [];
@@ -305,6 +277,9 @@ function sampleGpu() {
         bs.proc = null; bs.readyPromise = null;
         log("evicted idle best-model server to free RAM");
     }
+    // Extensions ride the same 1 s tick (ClosedCaptionsNotes: LLM idle
+    // eviction + its summarization-queue drain heartbeat).
+    fireEngineExtensions("tick");
     if (locked) return;    // don't measure our own decode
     const p = findGpuBusyPath();
     if (!p) return;
@@ -317,7 +292,7 @@ function sampleGpu() {
 }
 
 // External GPU demand estimate, 0..100 (0 if we can't measure).
-function externalDemand(): number {
+export function externalDemand(): number {
     if (!findGpuBusyPath() || gpuBaseline > 100) return 0;
     return Math.max(0, Math.round(gpuIdleEma - gpuBaseline));
 }
@@ -345,6 +320,9 @@ function partialPolicy(): { allow: boolean; duty: number } {
 let onAC = true;
 let cpuFreqRatio = 1;   // current CPU clock / max (a direct "how throttled" reading)
 let lastPowerPoll = 0;
+
+// AC/battery accessor for extensions (notes passes space out on battery).
+export function isOnAC(): boolean { return onAC; }
 
 // Linux: cheap sysfs reads (every tick). Windows/macOS: spawning a query is
 // expensive, so throttle to ~10 s and update asynchronously.
@@ -414,158 +392,6 @@ function effectiveTier(): "live" | "reduced" | "finals" {
     return p.duty >= 0.5 ? "live" : "reduced";
 }
 
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-
-// Kill whatever is holding our loopback port before we spawn. When Vesktop is
-// hard-quit/restarted (or crashes) its whisper-server child is orphaned rather
-// than terminated, and that orphan keeps the port AND a CPU core — a new session
-// then either collides or, worse, talks to the STALE (possibly slower/old-build)
-// server. Reaping the port on every (re)spawn guarantees the live server is
-// always the one WE just started, with the current binary + flags. Best-effort
-// and cross-platform; a failure just falls through to the spawn.
-async function freePort(port: number): Promise<void> {
-    const wantPort = String(port);
-    try {
-        if (platform() === "linux") {
-            // Self-contained: scan /proc for a whisper-server started on our port.
-            // No lsof/fuser dependency — those aren't guaranteed on Vesktop's PATH
-            // (NixOS minimal env), which would make an external-tool reap a silent
-            // no-op and let the orphan survive.
-            let pids: string[] = [];
-            try { pids = readdirSync("/proc").filter(d => /^\d+$/.test(d)); } catch { return; }
-            for (const pid of pids) {
-                let cmd = "";
-                try { cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8"); } catch { continue; }
-                const parts = cmd.split("\0");
-                const pIdx = parts.indexOf("--port");
-                if (parts.some(p => p.includes("whisper-server")) && pIdx >= 0 && parts[pIdx + 1] === wantPort) {
-                    try { process.kill(parseInt(pid, 10), "SIGKILL"); log(`reaped stale whisper-server pid ${pid}`); } catch { /* ignore */ }
-                }
-            }
-        } else if (platform() === "win32") {
-            let out = "";
-            try { out = (await pexecFile(sys32("netstat.exe"), ["-ano"])).stdout; } catch { return; }
-            const pids = new Set<string>();
-            for (const line of out.split("\n")) {
-                if (line.includes(":" + port) && /LISTENING/i.test(line)) {
-                    const cols = line.trim().split(/\s+/);
-                    const pid = cols[cols.length - 1];
-                    if (/^\d+$/.test(pid) && pid !== "0") pids.add(pid);
-                }
-            }
-            for (const pid of pids) { try { await pexecFile(sys32("taskkill.exe"), ["/F", "/PID", pid]); } catch { /* ignore */ } }
-        } else {
-            // macOS / other: lsof is present by default on darwin.
-            let out = "";
-            try { out = (await pexecFile("lsof", ["-ti", `tcp:${port}`])).stdout; } catch { return; }
-            for (const pid of out.split(/\s+/).filter(Boolean)) {
-                const n = parseInt(pid, 10);
-                if (n > 0) { try { process.kill(n, "SIGKILL"); } catch { /* ignore */ } }
-            }
-        }
-    } catch { /* best-effort */ }
-}
-
-// ── Download / verify / extract helpers ──────────────────────────────────────
-function sha256File(p: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const h = createHash("sha256");
-        const s = createReadStream(p);
-        s.on("data", d => h.update(d));
-        s.on("end", () => resolve(h.digest("hex")));
-        s.on("error", reject);
-    });
-}
-
-// Resumable, pausable download. Continues an existing partial at `dest` via an
-// HTTP Range request (so a paused/interrupted big-model download picks up where it
-// left off instead of restarting), and can be paused mid-stream: setDownloadPaused
-// aborts the fetch, we keep the bytes already on disk, wait, then re-request the
-// remainder. Progress is reported as (bytesDone, bytesTotal). Safe against a torn
-// tail — we always re-Range from the actual on-disk size, and the SHA check at the
-// call site is the final guard.
-async function downloadResumable(url: string, dest: string, onProgress: (done: number, total: number) => void): Promise<void> {
-    let start = 0;
-    try { if (existsSync(dest)) start = statSync(dest).size; } catch { start = 0; }
-    let total = 0;
-    for (;;) {
-        while (downloadPaused) await sleep(400);   // hold here until the user resumes
-        const ac = new AbortController();
-        currentDownloadAbort = ac;
-        let res: Awaited<ReturnType<typeof fetch>>;
-        try {
-            res = await fetch(url, {
-                redirect: "follow",
-                signal: ac.signal,
-                headers: start > 0 ? { Range: `bytes=${start}-` } : {},
-            });
-        } catch (e) {
-            currentDownloadAbort = null;
-            if (downloadPaused) continue;          // aborted by a pause → loop & wait
-            throw e;
-        }
-        if (res.status === 416) { currentDownloadAbort = null; return; }   // range past EOF → already complete
-        if (!res.ok || !res.body) { currentDownloadAbort = null; throw new Error(`GET ${url} → ${res.status}`); }
-        const partial = res.status === 206;
-        if (start > 0 && !partial) {               // server ignored Range → restart clean
-            start = 0;
-            try { rmSync(dest, { force: true }); } catch { /* ignore */ }
-        }
-        const len = Number(res.headers.get("content-length") || 0);
-        total = partial ? start + len : len;
-        let done = start;
-        onProgress(done, total);
-        const body = Readable.fromWeb(res.body as any);
-        body.on("data", (c: Buffer) => { done += c.length; onProgress(done, total); });
-        try {
-            await pipeline(body, createWriteStream(dest, { flags: partial ? "a" : "w" }));
-            currentDownloadAbort = null;
-            return;                                 // finished
-        } catch (e) {
-            currentDownloadAbort = null;
-            if (downloadPaused) {                    // paused mid-stream → resume from on-disk size
-                try { start = existsSync(dest) ? statSync(dest).size : start; } catch { /* keep */ }
-                continue;
-            }
-            throw e;
-        }
-    }
-}
-
-// Absolute paths to Windows system tools. We do NOT trust the spawned Electron
-// process's PATH — on a locked-down box it can lack System32, so a bare
-// `powershell`/`tar`/`netstat` spawn fails with ENOENT (this is the most likely
-// cause of the "ENOENT" a tester hit right after the model download: the engine
-// unpack step shelled out to a bare `powershell`). Resolve from %SystemRoot%.
-function winRoot(): string { return process.env.SystemRoot || process.env.windir || "C:\\Windows"; }
-function sys32(exe: string): string { return join(winRoot(), "System32", exe); }
-function psExe(): string { return join(winRoot(), "System32", "WindowsPowerShell", "v1.0", "powershell.exe"); }
-
-async function extract(archive: string, kind: "zip" | "tgz", destDir: string): Promise<void> {
-    mkdirSync(destDir, { recursive: true });
-    if (kind === "zip") {
-        if (platform() === "win32") {
-            // Windows 10 (1803+) ships bsdtar as System32\tar.exe, which extracts
-            // .zip too — try it (absolute path) first; fall back to PowerShell's
-            // Expand-Archive (also absolute). Both resolved from %SystemRoot% so a
-            // missing PATH can't ENOENT us.
-            try {
-                await pexecFile(sys32("tar.exe"), ["-xf", archive, "-C", destDir]);
-                return;
-            } catch { /* fall through to PowerShell */ }
-            await pexecFile(psExe(), [
-                "-NoProfile", "-NonInteractive", "-Command",
-                `Expand-Archive -Force -LiteralPath '${archive}' -DestinationPath '${destDir}'`,
-            ]);
-        } else {
-            await pexecFile("unzip", ["-o", archive, "-d", destDir]);
-        }
-    } else {
-        // GNU/bsd tar handles .tar.gz on Linux & macOS.
-        await pexecFile("tar", ["-xzf", archive, "-C", destDir]);
-    }
-}
-
 // Does this Windows box have an NVIDIA GPU (→ fetch the CUDA build)?
 async function windowsHasNvidia(): Promise<boolean> {
     try {
@@ -617,7 +443,6 @@ function findServerBinary(dir: string): string | null {
 }
 
 // ── Resolve the server binary (env → cached → download → PATH) ────────────────
-interface ResolvedBin { bin: string; libDir: string; }
 async function resolveBinary(): Promise<ResolvedBin | null> {
     if (process.env.CC_WHISPER_BIN) {
         const bin = process.env.CC_WHISPER_BIN;
@@ -768,12 +593,21 @@ async function ensureServerFor(role: Role): Promise<boolean> {
             proc.stderr?.on("data", d => log(`${role}:`, String(d).trim()));
             proc.on("exit", code => {
                 log(`whisper-server ${role} exited (${code})`);
+                // 0xC0000135 = STATUS_DLL_NOT_FOUND. The upstream MSVC builds need the
+                // VC++ runtime, which debloated Windows images (Tiny11) don't ship —
+                // found live in VM testing: the server dies instantly and the user
+                // only saw a start timeout. Name the actual fix instead.
+                if (platform() === "win32" && (code === 3221225781 || code === -1073741515)) {
+                    setStatus("error", "Speech engine needs the Microsoft Visual C++ runtime — install https://aka.ms/vs/17/release/vc_redist.x64.exe and restart Discord.");
+                }
                 s.proc = null;
                 s.readyPromise = null;
                 if (role === "fast" && status.phase === "ready") setStatus("idle");
             });
 
-            const deadline = Date.now() + 120_000;
+            // Generous: a cold model load on a slow disk/CPU (VM, old laptop)
+            // can take minutes — 120 s timed out a server that was fine.
+            const deadline = Date.now() + 300_000;
             while (Date.now() < deadline) {
                 if (!s.proc || s.proc.killed) return false;
                 try {
@@ -786,6 +620,11 @@ async function ensureServerFor(role: Role): Promise<boolean> {
                 await sleep(250);
             }
             setStatus("error", "Speech engine did not start in time");
+            // Kill the stuck server so the NEXT request re-provisions cleanly —
+            // leaving it alive cached this readyPromise's false forever (the
+            // ensure guard saw a live proc and never retried; found in VM testing).
+            try { s.proc?.kill("SIGKILL"); } catch { /* ignore */ }
+            s.proc = null;
             return false;
         } catch (e) {
             err(`ensureServerFor(${role}) failed`, e);   // full stack → log file
@@ -972,6 +811,9 @@ export async function stop(_: IpcMainInvokeEvent): Promise<void> {
         s.proc = null;
         s.readyPromise = null;
     }
+    // Extensions drop their dependent processes too (the notes LLM; its
+    // queue intentionally survives so pending work runs when we're back).
+    fireEngineExtensions("stop");
     if (gpuSampler) { clearInterval(gpuSampler); gpuSampler = null; }
     try { popoutWin?.close(); } catch { /* ignore */ }
     popoutWin = null;
@@ -1002,7 +844,11 @@ function writePopoutHtml(theme: any) {
   .btn{-webkit-app-region:no-drag;cursor:pointer;color:${theme?.dim || "#949ba4"};font-size:12px;font-weight:700;padding:2px 5px;border-radius:4px;display:flex;align-items:center}
   .btn:hover{color:${theme?.text || "#fff"};background:rgba(127,127,127,.15)}
   .btn svg{display:block;width:15px;height:15px;fill:currentColor}
-  #body{padding:8px 10px;height:calc(100% - 28px);overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin}
+  #body{box-sizing:border-box;padding:8px 10px;height:calc(100% - 28px);overflow-y:auto;display:flex;flex-direction:column;gap:5px;scrollbar-width:thin;scrollbar-color:${theme?.scrollThumb || "rgba(255,255,255,0.16)"} transparent}
+  #body::-webkit-scrollbar{width:8px;height:8px}
+  #body::-webkit-scrollbar-thumb{background:${theme?.scrollThumb || "rgba(255,255,255,0.16)"};border-radius:4px}
+  #body::-webkit-scrollbar-track{background:transparent}
+  #body::-webkit-scrollbar-corner{background:transparent}
   .row{font-size:14px;line-height:1.4;word-break:break-word}
   .nm{font-weight:700}
 </style></head><body>
@@ -1021,6 +867,7 @@ function render(caps) {
   body.replaceChildren();
   for (const c of caps) {
     const row = document.createElement('div'); row.className = 'row';
+    if (c.chat) { const ic = document.createElement('span'); ic.textContent = '\u{1F4AC} '; ic.style.color = DIM; row.appendChild(ic); }
     const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = c.name + ': '; nm.style.color = c.color || ACCENT; row.appendChild(nm);
     if (c.low) { const t = document.createElement('span'); t.textContent = '\u26A0\uFE0F '; row.appendChild(t); }
     const base = c.final ? TEXT : DIM;

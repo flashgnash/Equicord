@@ -31,11 +31,11 @@ import { definePluginSettings } from "@api/Settings";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findStoreLazy } from "@webpack";
-import { Toasts } from "@webpack/common";
+import { FluxDispatcher, Toasts } from "@webpack/common";
 
 const Native = VencordNative.pluginHelpers.ClosedCaptions as PluginNative<typeof import("./native")>;
 const logger = new Logger("ClosedCaptions");
-const VERSION = "cc-3";
+const VERSION = "cc-5";
 
 const UserStore = findStoreLazy("UserStore");
 // For capturing your OWN voice: SpeakingStore mirrors Discord's real transmit
@@ -45,6 +45,8 @@ const UserStore = findStoreLazy("UserStore");
 const SpeakingStore = findStoreLazy("SpeakingStore");
 const MediaEngineStore = findStoreLazy("MediaEngineStore");
 const SelectedChannelStore = findStoreLazy("SelectedChannelStore");
+// For checking whether a DM's other party is in the current voice call.
+const VoiceStateStore = findStoreLazy("VoiceStateStore");
 // For colouring speaker names by their role colour (and respecting the IrcColors
 // plugin, which recolours everyone by a hash of their id).
 const GuildMemberStore = findStoreLazy("GuildMemberStore");
@@ -116,7 +118,94 @@ function resolvePalette(): Palette {
 // Resolved at start() (once the theme's stylesheet is present).
 let C: Palette = resolvePalette();
 
-const PANE_WIDTH = 340;   // docked sidebar width (px)
+// ── Extension API ────────────────────────────────────────────────────────────
+// Other plugins (ClosedCaptionsNotes) extend the captions UI and pipeline
+// through this registry instead of living inside this file. All plugins share
+// one renderer bundle, so importing { registerCcExtension, ccApi } from this
+// module gives extensions the live module instance. ClosedCaptions starts
+// before its dependents (Vencord starts dependencies first), so the pane may
+// already be mounted when an extension registers — registration mounts it
+// immediately in that case.
+export type CcPalette = Palette;
+
+export interface CcUtterance {
+    userId: string;
+    name: string;            // resolved display name (server nick preferred)
+    uttId: number;           // caption id of this utterance's transcript line
+    chunks: Int16Array[];    // raw PCM frames of the utterance (incl. preroll)
+    totalSamples: number;
+    sampleRate: number;
+    voicedMs: number;
+}
+
+export interface CcExtension {
+    id: string;
+    /** every second, from the captions status tick (no extra timers) */
+    onTick?: () => void;
+    /** a finished utterance (≥ min length), fired BEFORE its buffers clear */
+    onUtterance?: (u: CcUtterance) => void;
+    /** add a header control; insert into `header` before `before` */
+    mountHeader?: (header: HTMLElement, before: HTMLElement) => void;
+    /** append a section to the bottom of the sidebar pane */
+    mountSection?: (pane: HTMLDivElement) => void;
+    /** the pane was torn down — drop references to mounted DOM */
+    onPaneUnmount?: () => void;
+    /** recolour injected controls (called alongside updateInjectedStates) */
+    syncState?: () => void;
+    /** ClosedCaptions itself is stopping */
+    onCcStop?: () => void;
+}
+
+const ccExtensions = new Map<string, CcExtension>();
+
+function mountExtensionUi(ext: CcExtension) {
+    try {
+        if (paneEl && paneHeaderEl && panePopBtn) {
+            ext.mountHeader?.(paneHeaderEl, panePopBtn);
+            ext.mountSection?.(paneEl);
+        }
+    } catch (e) {
+        logger.error(`extension ${ext.id} mount failed`, e);
+    }
+}
+
+export function registerCcExtension(ext: CcExtension) {
+    ccExtensions.set(ext.id, ext);
+    mountExtensionUi(ext);   // pane may already be live (we start first)
+}
+
+export function unregisterCcExtension(id: string) {
+    ccExtensions.delete(id);
+}
+
+function fireExtensions(hook: (ext: CcExtension) => void) {
+    for (const ext of ccExtensions.values()) {
+        try { hook(ext); } catch (e) { logger.error(`extension ${ext.id} hook failed`, e); }
+    }
+}
+
+// Read-only accessors for extensions — live views into this module's state.
+export const ccApi = {
+    getPalette: () => C,
+    getCaptions: () => captions as readonly Caption[],
+    getEngineGpu: () => engineGpu,
+    inVoice: () => inVoice(),
+    resolveName: (userId: string) => resolveName(userId),
+    participantIds: () => [...captures.keys()],
+    popoutTheme: () => popoutTheme(),
+};
+
+// Docked sidebar width (px) — user-resizable by dragging the pane's left
+// edge; initialized from the persisted setting in start().
+let paneWidth = 340;
+function applyPaneWidth() {
+    if (!paneEl) return;
+    if (paneEl.parentElement === document.body) paneEl.style.width = `${paneWidth}px`;   // fixed fallback
+    else {
+        paneEl.style.flex = `0 0 ${paneWidth}px`;
+        paneEl.style.minWidth = `${paneWidth}px`;
+    }
+}
 
 // ── Settings ─────────────────────────────────────────────────────────────────
 const settings = definePluginSettings({
@@ -163,6 +252,18 @@ const settings = definePluginSettings({
     transcriptPane: {
         type: OptionType.BOOLEAN,
         description: "Show the scrolling transcript panel docked to the right of the call window.",
+        default: true,
+        onChange: () => render(),
+    },
+    interleaveChat: {
+        type: OptionType.BOOLEAN,
+        description: "Interleave typed messages from the call's text chat (the voice channel's chat, or the DM / group chat for private calls) into the transcript, marked with 💬.",
+        default: true,
+        onChange: () => render(),
+    },
+    interleaveDms: {
+        type: OptionType.BOOLEAN,
+        description: "Also interleave private DMs between you and people in the voice call, marked with 🔒. Only you see them — but mind the pane if you're screen-sharing.",
         default: true,
         onChange: () => render(),
     },
@@ -259,6 +360,13 @@ const settings = definePluginSettings({
         description: "Max caption lines shown at once.",
         default: 4,
     },
+    // Layout state persisted from the drag handle (sidebar width px).
+    paneWidthPx: {
+        type: OptionType.NUMBER,
+        description: "Internal: sidebar width.",
+        default: 340,
+        hidden: true,
+    },
 });
 
 function pushConfig() {
@@ -284,7 +392,21 @@ function toast(message: string, type: number) {
     Toasts.show({ message, type, id: Toasts.genId(), options: { position: Toasts.Position.BOTTOM } });
 }
 
+// Server nickname in the current voice channel's guild, if any — captions should
+// read the same as the member list next to them.
+function guildNick(userId: string): string | null {
+    try {
+        if (!userId) return null;
+        const vc = SelectedChannelStore?.getVoiceChannelId?.();
+        const guildId = vc ? ChannelStore?.getChannel?.(vc)?.guild_id : null;
+        if (!guildId) return null;
+        return GuildMemberStore?.getMember?.(guildId, userId)?.nick || null;
+    } catch { return null; }
+}
+
 function resolveName(userId: string): string {
+    const nick = guildNick(userId);
+    if (nick) return nick;
     try {
         const u = UserStore?.getUser?.(userId);
         if (u) return u.globalName || u.username || ("User " + userId.slice(-4));
@@ -345,7 +467,10 @@ function discordUsernameClass(): string {
 // (partial) results update the SAME line in place while the speaker talks, and
 // the final result replaces it. `final` drives a subtle dimming of live text.
 interface Word { w: string; p: number; }
-interface Caption { id: number; userId: string; name: string; text: string; ts: number; final: boolean; confidence: number; words: Word[]; }
+// `chat`/`msgId` mark a TYPED message interleaved from the call's text chat
+// (msgId keys edits/deletes); chat lines carry confidence 0 so no ⚠ ever shows.
+// `dm` marks a chat line from a private 1:1 DM with a call participant (🔒).
+export interface Caption { id: number; userId: string; name: string; text: string; ts: number; final: boolean; confidence: number; words: Word[]; chat?: boolean; dm?: boolean; msgId?: string; }
 interface Infer { text: string; confidence: number; words: Word[]; }
 // FULL history — the transcript pane shows all of it (scrollable); the overlay
 // derives a recent, time-limited slice from the tail. Capped so a marathon call
@@ -383,6 +508,100 @@ function upsertCaption(id: number, userId: string, res: Infer, final: boolean) {
 function finalizeCaption(id: number) {
     const ex = captions.find(c => c.id === id);
     if (ex && !ex.final) { ex.final = true; ex.ts = Date.now(); render(); }
+}
+
+// ── Text-chat interleave ─────────────────────────────────────────────────────
+// Typed messages from the call's text chat, woven into the same transcript.
+// One id check covers every call shape: in a DM/group call the "voice channel"
+// id IS the private channel, and a guild voice channel's built-in text chat
+// posts messages under the voice channel's own id — so we simply keep messages
+// whose channel_id equals the current voice channel id.
+
+// Only ordinary messages and replies; joins/pins/boosts etc. are UI noise here.
+const CHAT_MSG_TYPES = new Set([0, 19]);
+
+function chatAuthorName(a: any): string {
+    const nick = guildNick(a?.id);
+    if (nick) return nick;
+    try {
+        const u = UserStore?.getUser?.(a?.id);
+        if (u) return u.globalName || u.username;
+    } catch { /* ignore */ }
+    return a?.global_name || a?.globalName || a?.username || ("User " + String(a?.id || "").slice(-4));
+}
+
+// Message text with placeholders for non-text payloads, so an image-only or
+// sticker-only message still leaves a visible line in the transcript.
+function chatText(m: any): string {
+    const parts: string[] = [];
+    const t = String(m?.content || "").trim();
+    if (t) parts.push(t);
+    const att = m?.attachments?.length | 0;
+    if (att) parts.push(att === 1 ? "[attachment]" : `[${att} attachments]`);
+    if (m?.sticker_items?.length || m?.stickers?.length) parts.push("[sticker]");
+    if (!t && m?.embeds?.length) parts.push("[embed]");
+    return parts.join(" ");
+}
+
+// Does a private 1:1 DM belong in this call's transcript? Yes when its other
+// party is currently IN the voice call — that DM is a side-channel of the same
+// conversation. Both directions are kept (their DMs to you AND your replies) so
+// the thread reads coherently. Group DMs and unrelated DMs stay out.
+function dmPartnerInCall(chan: string, vc: string): boolean {
+    try {
+        if (!chan || chan === vc) return false;   // the call's own chat isn't a DM
+        const ch = ChannelStore?.getChannel?.(chan);
+        if (!ch || ch.type !== 1) return false;   // 1 = 1:1 DM
+        const other = String(ch.getRecipientId?.() || ch.recipients?.[0] || "");
+        if (!other) return false;
+        const states = VoiceStateStore?.getVoiceStatesForChannel?.(vc);
+        if (!states) return false;
+        return Object.entries(states).some(([k, v]: [string, any]) => (v?.userId || k) === other);
+    } catch { return false; }
+}
+
+function onChatCreate(e: any) {
+    try {
+        if (e?.optimistic) return;   // pending local echo — the gateway copy follows
+        const m = e?.message;
+        const chan = m?.channel_id || e?.channelId;
+        const vc = SelectedChannelStore?.getVoiceChannelId?.();
+        if (!m?.author?.id || !vc) return;
+        const inCallChat = chan === vc && !!settings.store.interleaveChat;
+        const isDm = !inCallChat && !!settings.store.interleaveDms && dmPartnerInCall(chan, vc);
+        if (!inCallChat && !isDm) return;
+        if (typeof m.type === "number" && !CHAT_MSG_TYPES.has(m.type)) return;
+        if (m.id && captions.some(c => c.msgId === m.id)) return;
+        const text = chatText(m);
+        if (!text) return;
+        captions.push({
+            id: ++uttCounter, userId: m.author.id, name: chatAuthorName(m.author),
+            text, ts: Date.now(), final: true, confidence: 0, words: [],
+            chat: true, dm: isDm, msgId: m.id,
+        });
+        if (captions.length > MAX_HISTORY) captions = captions.slice(-MAX_HISTORY);
+        render();
+    } catch (err) { logger.error("chat create failed", err); }
+}
+
+function onChatUpdate(e: any) {
+    try {
+        const m = e?.message;
+        if (!m?.id) return;
+        const ex = captions.find(c => c.msgId === m.id);
+        if (!ex) return;
+        const text = chatText(m);
+        if (text && text !== ex.text) { ex.text = text; render(); }
+    } catch (err) { logger.error("chat update failed", err); }
+}
+
+function onChatDelete(e: any) {
+    try {
+        if (!e?.id) return;
+        const before = captions.length;
+        captions = captions.filter(c => c.msgId !== e.id);
+        if (captions.length !== before) render();
+    } catch (err) { logger.error("chat delete failed", err); }
 }
 
 // ── Per-user audio capture + VAD ─────────────────────────────────────────────
@@ -457,6 +676,16 @@ function flush(cap: Capture) {
     const total = cap.pendingSamples;
     const id = cap.uttId;
     const b64 = total > 0 ? encodePending(cap) : "";
+    // Extensions get the finished utterance WITH its PCM before buffers clear
+    // (ClosedCaptionsNotes fingerprints the DM's voice from it).
+    if (voicedMs >= settings.store.minUtteranceMs && total > 0) {
+        const u: CcUtterance = {
+            userId: cap.userId, name: resolveName(cap.userId), uttId: id,
+            chunks: cap.pending, totalSamples: total,
+            sampleRate: getCapCtx().sampleRate, voicedMs,
+        };
+        fireExtensions(ext => ext.onUtterance?.(u));
+    }
     cap.pending = [];
     cap.pendingSamples = 0;
     cap.speaking = false;
@@ -794,6 +1023,12 @@ function renderOverlay() {
         const chip = makeChip("15px");
         chip.style.opacity = String(fade);
 
+        if (c.chat) {
+            const ic = document.createElement("span");
+            ic.textContent = "💬 ";
+            ic.style.color = C.dim;
+            chip.appendChild(ic);
+        }
         const nm = document.createElement("span");
         nm.className = discordUsernameClass();   // inherit theme/plugin username CSS
         nm.textContent = c.name;
@@ -807,6 +1042,7 @@ function renderOverlay() {
 
 // ── Transcript pane (right-docked, scrolling full log) ───────────────────────
 let paneEl: HTMLDivElement | null = null;
+let paneHeaderEl: HTMLDivElement | null = null;
 let paneBodyEl: HTMLDivElement | null = null;
 let paneStatusEl: HTMLDivElement | null = null;
 let paneBacklogEl: HTMLDivElement | null = null;
@@ -970,11 +1206,13 @@ function mountPane() {
     const style = document.createElement("style");
     style.id = "closed-captions-style";
     style.textContent = `
-        #closed-captions-pane .cc-body { scrollbar-width: thin; scrollbar-color: ${C.scrollThumb} transparent; }
-        #closed-captions-pane .cc-body::-webkit-scrollbar { width: 8px; height: 8px; }
-        #closed-captions-pane .cc-body::-webkit-scrollbar-thumb { background: ${C.scrollThumb}; border-radius: 4px; }
-        #closed-captions-pane .cc-body::-webkit-scrollbar-track { background: transparent; }
-        #closed-captions-pane .cc-body::-webkit-scrollbar-corner { background: transparent; }
+        #closed-captions-pane .cc-body, #closed-captions-notes .cc-body { scrollbar-width: thin; scrollbar-color: ${C.scrollThumb} transparent; }
+        #closed-captions-pane .cc-body::-webkit-scrollbar, #closed-captions-notes .cc-body::-webkit-scrollbar { width: 8px; height: 8px; }
+        #closed-captions-pane .cc-body::-webkit-scrollbar-thumb, #closed-captions-notes .cc-body::-webkit-scrollbar-thumb { background: ${C.scrollThumb}; border-radius: 4px; }
+        #closed-captions-pane .cc-body::-webkit-scrollbar-track, #closed-captions-notes .cc-body::-webkit-scrollbar-track { background: transparent; }
+        #closed-captions-pane .cc-body::-webkit-scrollbar-corner, #closed-captions-notes .cc-body::-webkit-scrollbar-corner { background: transparent; }
+        @keyframes cc-spin { to { transform: rotate(360deg); } }
+        .cc-spin { display: inline-block; animation: cc-spin 0.9s linear infinite; transform-origin: 50% 52%; }
     `;
     document.head.appendChild(style);
     paneStyleEl = style;
@@ -987,8 +1225,34 @@ function mountPane() {
         background: C.bg, borderLeft: `1px solid ${C.border}`,
         display: "flex", flexDirection: "column", overflow: "hidden",
         boxShadow: C.shadow, fontFamily: C.font, color: C.text,
-        flex: `0 0 ${PANE_WIDTH}px`, minWidth: `${PANE_WIDTH}px`, alignSelf: "stretch",
+        flex: `0 0 ${paneWidth}px`, minWidth: `${paneWidth}px`, alignSelf: "stretch",
     } as Partial<CSSStyleDeclaration>);
+
+    // Left-edge drag handle — resize the whole sidebar horizontally. The
+    // width persists across sessions (hidden paneWidthPx setting).
+    const wGrip = document.createElement("div");
+    wGrip.title = "Drag to resize";
+    Object.assign(wGrip.style, {
+        position: "absolute", left: "0", top: "0", bottom: "0", width: "5px",
+        cursor: "ew-resize", zIndex: "10",
+    } as Partial<CSSStyleDeclaration>);
+    wGrip.onmousedown = e => {
+        e.preventDefault();
+        const startX = e.clientX;
+        const startW = paneWidth;
+        const move = (ev: MouseEvent) => {
+            paneWidth = Math.min(900, Math.max(240, startW + (startX - ev.clientX)));
+            applyPaneWidth();
+        };
+        const up = () => {
+            settings.store.paneWidthPx = paneWidth;
+            document.removeEventListener("mousemove", move, true);
+            document.removeEventListener("mouseup", up, true);
+        };
+        document.addEventListener("mousemove", move, true);
+        document.addEventListener("mouseup", up, true);
+    };
+    el.appendChild(wGrip);
 
     const header = document.createElement("div");
     Object.assign(header.style, {
@@ -1036,6 +1300,7 @@ function mountPane() {
     close.onmouseleave = () => { close.style.color = C.dim; };
     close.onclick = () => { paneCollapsed = true; renderPane(); };
     header.append(title, modeBtn, pop, close);
+    paneHeaderEl = header;
 
     // Dropdown menu for the processing level (absolute within the fixed pane).
     const menu = document.createElement("div");
@@ -1101,6 +1366,9 @@ function mountPane() {
     el.append(header, menu, status, prog.root, body, backlog);
     paneEl = el;
     paneBodyEl = body;
+    // Extensions hang off the pane (ClosedCaptionsNotes: 📝 header button +
+    // the notes split at the bottom of the sidebar).
+    fireExtensions(mountExtensionUi);
     // Placed into Discord's layout row (or fixed fallback) by dockPane() on render.
 
     // Close the mode menu on any outside click.
@@ -1134,7 +1402,8 @@ function mountPane() {
 
 function unmountPane() {
     if (paneDocClick) { document.removeEventListener("click", paneDocClick, true); paneDocClick = null; }
-    paneEl?.remove(); paneEl = null; paneBodyEl = null; paneStatusEl = null; paneBacklogEl = null;
+    paneEl?.remove(); paneEl = null; paneHeaderEl = null; paneBodyEl = null; paneStatusEl = null; paneBacklogEl = null;
+    fireExtensions(ext => ext.onPaneUnmount?.());   // their DOM went down with the pane
     paneModeBtn = null; paneModeText = null; paneModeMenu = null; paneModeOpen = false; panePopBtn = null;
     paneProgWidget = null;
     paneTabEl?.remove(); paneTabEl = null;
@@ -1177,7 +1446,7 @@ function dockPane() {
             Object.assign(paneEl.style, {
                 position: "relative", top: "", right: "", bottom: "", left: "",
                 height: "auto", zIndex: "", order: "9999",   // far RIGHT of the flex row
-                flex: `0 0 ${PANE_WIDTH}px`, alignSelf: "stretch",
+                flex: `0 0 ${paneWidth}px`, alignSelf: "stretch",
             } as Partial<CSSStyleDeclaration>);
             row.appendChild(paneEl);
         }
@@ -1185,7 +1454,7 @@ function dockPane() {
         // Fallback if no horizontal flex row is found: float fixed on the right.
         Object.assign(paneEl.style, {
             position: "fixed", top: "0", right: "0", bottom: "0", height: "",
-            width: `${PANE_WIDTH}px`, zIndex: "100",
+            width: `${paneWidth}px`, zIndex: "100",
         } as Partial<CSSStyleDeclaration>);
         document.body.appendChild(paneEl);
     }
@@ -1213,12 +1482,14 @@ function renderPane() {
     // Show while in a call, when there's transcript to read back, or while the
     // engine is downloading/warming up (so first-run progress is visible).
     const on = settings.store.transcriptPane && (inVoice() || captions.length > 0 || engineBusy());
-    const shown = on && !paneCollapsed;
+    // While popped out, the pop-out window IS the captions view — hide the docked
+    // pane (and its reopen tab) so the transcript isn't shown twice.
+    const shown = on && !paneCollapsed && !popoutOpen;
     // Dock as a flex column so Discord reserves the space; display:none gives the
     // space straight back to the app when hidden.
     if (shown) dockPane();
     paneEl.style.display = shown ? "flex" : "none";
-    paneTabEl.style.display = on && paneCollapsed ? "block" : "none";
+    paneTabEl.style.display = on && paneCollapsed && !popoutOpen ? "block" : "none";
     updateInjectedStates();
     renderModeControl();
     if (panePopBtn) panePopBtn.style.color = popoutOpen ? C.accent : C.dim;
@@ -1241,6 +1512,13 @@ function renderPane() {
     for (const c of captions) {
         const row = document.createElement("div");
         Object.assign(row.style, { fontSize: "14px", lineHeight: "1.4", wordBreak: "break-word" } as Partial<CSSStyleDeclaration>);
+        if (c.chat) {
+            const ic = document.createElement("span");
+            ic.textContent = "💬 ";
+            ic.title = "Typed in the call's text chat";
+            ic.style.color = C.dim;
+            row.appendChild(ic);
+        }
         const nm = document.createElement("span");
         nm.className = discordUsernameClass();   // inherit theme/plugin username CSS
         nm.textContent = c.name + ": ";
@@ -1279,6 +1557,9 @@ function render() {
 }
 
 function togglePane() {
+    // While popped out the docked pane is hidden — CC brings captions back
+    // in-window by closing the pop-out instead of toggling the collapse flag.
+    if (popoutOpen) { paneCollapsed = false; void togglePopout(); return; }
     // If it's off/hidden for lack of content, opening should still work — clear
     // the collapse flag; renderPane decides visibility from context.
     paneCollapsed = !paneCollapsed;
@@ -1293,7 +1574,7 @@ function captionsVisible(): boolean {
 
 // Theme values handed to the pop-out window so it matches the current Discord theme.
 function popoutTheme() {
-    return { bg: C.bg, headerBg: C.headerBg, border: C.border, text: C.text, dim: C.dim, accent: C.accent, warn: C.warn, font: C.font };
+    return { bg: C.bg, headerBg: C.headerBg, border: C.border, text: C.text, dim: C.dim, accent: C.accent, warn: C.warn, font: C.font, scrollThumb: C.scrollThumb };
 }
 
 // Caption data for the pop-out window, with low-confidence flags precomputed so the
@@ -1306,6 +1587,7 @@ function popoutData() {
         name: c.name,
         color: nameColor(c.userId),
         final: c.final,
+        chat: !!c.chat,
         low: flag && c.final && c.confidence > 0 && c.confidence < lineThresh,
         text: c.text,
         words: flag ? (c.words || []).map(w => ({ w: w.w, low: w.p < wordThresh })) : [],
@@ -1352,11 +1634,12 @@ function accessibleName(el: HTMLElement): string {
 }
 
 function updateInjectedStates() {
-    const active = !!paneEl && paneEl.style.display !== "none";
+    const active = popoutOpen || (!!paneEl && paneEl.style.display !== "none");
     document.querySelectorAll<HTMLElement>("[data-cc-toggle]").forEach(b => {
         b.style.color = active ? C.accent : C.dim;
         b.style.background = active ? "rgba(127,127,127,0.12)" : "transparent";
     });
+    fireExtensions(ext => ext.syncState?.());
 }
 
 // A FRESH fixed-size button (NOT a clone of Discord's button — cloning inherited
@@ -1394,9 +1677,22 @@ function injectToggles() {
             let slot: HTMLElement = share;
             while (slot.parentElement && slot.parentElement.children.length === 1) slot = slot.parentElement;
             const row = slot.parentElement;
-            if (!row || row.querySelector("[data-cc-toggle]")) continue;
+            if (!row) continue;
+            // Already injected — in the row itself, or hung after it (fallback below).
+            if (row.querySelector("[data-cc-toggle]") || row.parentElement?.querySelector(":scope > [data-cc-toggle]")) continue;
+            const before = share.getBoundingClientRect().width;
             const size = share.getBoundingClientRect().height || 32;
-            row.insertBefore(makeCCButton(size), slot.nextSibling);
+            const btn = makeCCButton(size);
+            row.insertBefore(btn, slot.nextSibling);
+            // Some of Discord's bars divide their width across children, so adding
+            // a button shrinks EVERY icon. Detect it by re-measuring the share
+            // button; if it shrank, take CC out of the row and hang it directly
+            // after the bar instead — the native icons keep their size.
+            const after = share.getBoundingClientRect().width;
+            if (before - after > 1 && row.parentElement) {
+                btn.style.alignSelf = "center";
+                row.parentElement.insertBefore(btn, row.nextSibling);
+            }
         }
         updateInjectedStates();
     } catch (e) {
@@ -1463,10 +1759,19 @@ export default definePlugin({
         logger.info(`ClosedCaptions ${VERSION} started`);
         try { logPath = await Native.getLogPath(); logger.info("log file:", logPath); } catch { /* ignore */ }
         C = resolvePalette();   // theme stylesheet is present by now
+        const pw = Number(settings.store.paneWidthPx);
+        paneWidth = Number.isFinite(pw) && pw >= 240 ? Math.min(900, pw) : 340;
         mountOverlay();
         mountPane();
         startObserver();        // inject "CC" toggle into Discord's control bars
         pushConfig();   // provisions + warms the engine so the first speaker isn't waiting
+
+        // Weave the call's text chat into the transcript (event-driven, no polling).
+        try {
+            FluxDispatcher.subscribe("MESSAGE_CREATE", onChatCreate);
+            FluxDispatcher.subscribe("MESSAGE_UPDATE", onChatUpdate);
+            FluxDispatcher.subscribe("MESSAGE_DELETE", onChatDelete);
+        } catch (e) { logger.error("chat subscribe failed", e); }
 
         reapTimer = setInterval(reap, 15000);
         // Re-render on a cadence so captions fade/expire and the backlog counter
@@ -1501,6 +1806,10 @@ export default definePlugin({
                     engineGpu = g;
                 }
             } catch { /* ignore */ }
+            // The docked pane is hidden while popped out, so notice the pop-out
+            // window being closed even when no caption is arriving to trigger a
+            // render — pushPopout reports it dead and renderPane restores the pane.
+            if (popoutOpen) pushPopout();
             // Start/stop our own-mic capture as we join/leave voice, and toggle
             // the transcript pane's visibility on that same transition.
             try {
@@ -1508,6 +1817,9 @@ export default definePlugin({
                 const iv = inVoice();
                 if (iv !== lastInVoice) { lastInVoice = iv; renderPane(); }
             } catch (e) { logger.error("voice sync", e); }
+            // Extensions ride this same tick (ClosedCaptionsNotes feeds settled
+            // transcript lines + fires its cadence from here — no extra timers).
+            fireExtensions(ext => ext.onTick?.());
         }, 1000);
 
         // Debug handle — inspect capture + engine state from the console.
@@ -1540,7 +1852,15 @@ export default definePlugin({
         if (expireTimer) { clearInterval(expireTimer); expireTimer = null; }
         if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
         stopObserver();
+        try {
+            FluxDispatcher.unsubscribe("MESSAGE_CREATE", onChatCreate);
+            FluxDispatcher.unsubscribe("MESSAGE_UPDATE", onChatUpdate);
+            FluxDispatcher.unsubscribe("MESSAGE_DELETE", onChatDelete);
+        } catch { /* ignore */ }
         if (popoutOpen) { popoutOpen = false; try { void Native.popout("close"); } catch { /* ignore */ } }
+        // Extensions flush their own state (ClosedCaptionsNotes: the
+        // not-yet-summarized transcript tail).
+        fireExtensions(ext => ext.onCcStop?.());
         stopOwnCapture();
         for (const id of [...captures.keys()]) teardownCapture(id);
         try { void capCtx?.close(); } catch { /* ignore */ }

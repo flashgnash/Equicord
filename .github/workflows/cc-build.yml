@@ -10,7 +10,8 @@ on:
     push:
         branches: [main]
         paths:
-            - "src/equicordplugins/closedCaptions/**"
+            - "src/equicordplugins/ClosedCaptions/**"
+            - "src/equicordplugins/ClosedCaptionsNotes/**"
             - ".github/workflows/cc-build.yml"
 
 permissions:
